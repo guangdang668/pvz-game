@@ -1,0 +1,900 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>校园 AR 运动交互 - 植物大战僵尸 (大屏提示版)</title>
+    
+    <!-- 引入 MediaPipe 核心视觉模型 -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+
+    <style>
+        /* ================= 赛博朋克视觉变量 ================= */
+        :root {
+            --neon-green: #39ff14; --neon-blue: #00ffff; --neon-purple: #b026ff;
+            --neon-red: #ff003c; --neon-yellow: #ffea00; --neon-pink: #ff66b2;
+            --bg-dark: #050508; --panel-bg: rgba(10, 10, 20, 0.9);
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; user-select: none; }
+        body {
+            background-color: var(--bg-dark); color: white; font-family: 'Segoe UI', system-ui, sans-serif;
+            overflow: hidden; background-image: radial-gradient(circle at 50% 0%, rgba(0, 255, 255, 0.05) 0%, transparent 60%);
+            transition: filter 0.5s;
+        }
+
+        /* 失败/无效动作震动特效 (其他地方均已移除震动) */
+        @keyframes shake {
+            0% { transform: translate(2px, 2px) rotate(0deg); }
+            20% { transform: translate(-4px, 0px) rotate(2deg); }
+            40% { transform: translate(2px, -2px) rotate(-1deg); }
+            60% { transform: translate(-4px, 2px) rotate(2deg); }
+            80% { transform: translate(-2px, -2px) rotate(-1deg); }
+            100% { transform: translate(2px, -4px) rotate(-2deg); }
+        }
+        .screen-shake { animation: shake 0.4s cubic-bezier(.36,.07,.19,.97) both; }
+
+        /* ================= 顶部全场信息 HUD ================= */
+        #hud {
+            position: absolute; top: 0; left: 0; width: 100%; height: 90px;
+            background: linear-gradient(to bottom, rgba(0,0,0,0.95), transparent);
+            display: flex; justify-content: space-between; align-items: center; padding: 0 40px; z-index: 100;
+        }
+        .hud-group { display: flex; gap: 15px; }
+        .hud-item {
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            background: rgba(0, 0, 0, 0.8); padding: 5px 20px; border-radius: 8px; border: 1px solid rgba(0,255,255,0.2);
+            min-width: 140px; transition: 0.3s;
+        }
+        .hud-label { font-size: 11px; color: #aaa; letter-spacing: 1px; }
+        .hud-value { font-size: 18px; font-weight: bold; text-shadow: 0 0 10px currentColor; margin-top: 3px; }
+        .text-green { color: var(--neon-green); } .text-blue { color: var(--neon-blue); } .text-purple { color: var(--neon-purple); }
+        .text-yellow { color: var(--neon-yellow); }
+
+        /* HIIT 节奏 */
+        #rhythm-indicator { display: flex; flex-direction: column; align-items: center; width: 300px; }
+        #rhythm-text { font-size: 18px; font-weight: bold; letter-spacing: 2px; }
+        .rhythm-bar { width: 100%; height: 8px; background: #333; margin-top: 5px; border-radius: 4px; overflow: hidden; }
+        #rhythm-progress { height: 100%; width: 100%; background: var(--neon-green); transition: width 1s linear; }
+
+        .btn {
+            background: rgba(0,0,0,0.5); border: 2px solid var(--neon-blue); color: var(--neon-blue);
+            padding: 8px 15px; font-weight: bold; border-radius: 8px; cursor: pointer; transition: 0.3s;
+            display: flex; align-items: center; justify-content: center;
+        }
+        .btn:hover { background: var(--neon-blue); color: #000; box-shadow: 0 0 15px var(--neon-blue); }
+        .btn-relocate { border-color: var(--neon-yellow); color: var(--neon-yellow); display: none; }
+        .btn-relocate:hover { background: var(--neon-yellow); color: #000; box-shadow: 0 0 15px var(--neon-yellow); }
+
+        /* ================= 视图层 ================= */
+        #view-container { position: absolute; top: 90px; bottom: 0; width: 100%; display: flex; justify-content: center; align-items: center; overflow: hidden; transition: filter 0.5s; }
+        .view { position: absolute; width: 100%; height: 100%; display: none; justify-content: center; align-items: center; flex-direction: column; }
+        .view.active { display: flex; }
+
+        /* 休息阶段视觉变暗 */
+        body.rest-phase #view-2d { filter: brightness(0.4) grayscale(0.5); }
+        body.rest-phase .entity.planting, body.rest-phase .entity.respawning { filter: brightness(2.5) drop-shadow(0 0 10px white) !important; z-index: 50; }
+
+        /* ================= 自适应缩放容器 ================= */
+        #board-scale-wrapper {
+            perspective: 1200px; transform-origin: center center;
+            display: flex; justify-content: center; align-items: center;
+        }
+
+        /* ================= 2D 场地 ================= */
+        #battle-board { 
+            position: relative; width: 1200px; height: 500px; 
+            transform: rotateX(30deg); transform-style: preserve-3d;
+        }
+        #grid-layout { display: grid; grid-template-columns: repeat(8, 1fr); grid-template-rows: repeat(4, 1fr); width: 100%; height: 100%; gap: 8px; position: absolute; z-index: 10; }
+        
+        .cell { background: rgba(255, 255, 255, 0.02); border: 1px dashed rgba(0,255,255,0.15); border-radius: 8px; position: relative; transition: 0.3s; display: flex; justify-content: center; align-items: center; }
+        
+        body.deploy-plant .cell.plant-zone { cursor: pointer; border: 1px solid var(--neon-green); background: rgba(57, 255, 20, 0.05); }
+        body.deploy-plant .cell.plant-zone:hover { box-shadow: 0 0 20px var(--neon-green) inset; }
+        body.deploy-zombie .cell.zombie-zone { cursor: pointer; border: 1px solid var(--neon-purple); background: rgba(176, 38, 255, 0.05); }
+        body.deploy-zombie .cell.zombie-zone:hover { box-shadow: 0 0 20px var(--neon-purple) inset; }
+
+        .divider-line { position: absolute; left: 50%; top: -10px; bottom: -10px; width: 4px; background: rgba(0, 255, 255, 0.3); transform: translateX(-50%); box-shadow: 0 0 15px var(--neon-blue); z-index: 5; pointer-events: none;}
+
+        /* ================= 实体卡片设计 ================= */
+        .entity {
+            width: 90%; height: 90%; border-radius: 10px; display: flex; flex-direction: column; justify-content: center; align-items: center;
+            position: relative; z-index: 20; transform: translateZ(10px); transition: 0.2s;
+            background: rgba(15,15,20,0.95); border: 2px solid currentColor; box-shadow: 0 0 15px currentColor, inset 0 0 10px rgba(0,0,0,0.8);
+        }
+        .entity .icon { font-size: 32px; filter: drop-shadow(0 0 5px currentColor); }
+        .entity .stats { font-size: 12px; font-weight: bold; color: #fff; text-align: center; margin-top:2px; text-shadow: 0 0 5px #000; }
+        .entity .task { font-size: 11px; font-weight: 900; background: rgba(0,0,0,0.7); padding: 2px 6px; border-radius: 4px; margin-top: 4px; border: 1px solid currentColor;}
+        
+        .user-tag { position: absolute; top: -12px; left: -10px; background: var(--neon-yellow); color: #000; font-size: 12px; padding: 2px 8px; border-radius: 10px; font-weight: 900; box-shadow: 0 0 10px var(--neon-yellow); z-index: 25;}
+        
+        .shield-ring { position: absolute; width: 115%; height: 115%; border: 3px solid var(--neon-yellow); border-radius: 50%; box-shadow: 0 0 20px var(--neon-yellow); pointer-events: none; }
+        .debuff-tag { position: absolute; top: -10px; right: -10px; font-size: 16px; background: #000; border-radius: 50%; padding: 2px; box-shadow: 0 0 10px #000; z-index: 25;}
+
+        .planting { opacity: 0.7; border-style: dashed; filter: grayscale(30%); }
+        .dead { filter: grayscale(100%); border-color: #444 !important; opacity: 0.3; box-shadow: none; }
+        .respawning { border-style: dashed; border-color: var(--neon-purple); opacity: 0.8; }
+        .atk-done { filter: brightness(0.5); }
+        
+        @keyframes hitFlash { 0% { background: rgba(255,0,0,0.9); box-shadow: 0 0 50px red inset; transform: scale(0.85); } 100% { background: rgba(15,15,20,0.95); box-shadow: 0 0 15px currentColor inset; transform: scale(1); } }
+        .hit-anim { animation: hitFlash 0.3s ease-out; }
+
+        #fx-canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 30; mix-blend-mode: screen; }
+
+        /* ================= 3D 捕捉界面 ================= */
+        .camera-feed {
+            width: 800px; height: 450px; background: #000; border: 2px solid var(--neon-blue); border-radius: 15px;
+            position: relative; overflow: hidden; display: flex; justify-content: center; align-items: center; box-shadow: 0 0 50px rgba(0,255,255,0.15);
+            transform-origin: center center;
+        }
+        #video-element { display: none; }
+        #pose-canvas { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+        #action-feedback { position: absolute; top: 40%; left: 50%; transform: translate(-50%, -50%); font-size: 60px; font-weight: 900; color: var(--neon-green); opacity: 0; transition: 0.2s; text-shadow: 0 0 30px currentColor; pointer-events: none; z-index: 100;}
+
+        /* ================= 阶段切换巨型提示 ================= */
+        #phase-alert {
+            position: fixed; top: 40%; left: 50%; transform: translate(-50%, -50%) scale(0);
+            font-size: 80px; font-weight: 900; z-index: 1000; pointer-events: none; text-align: center;
+            opacity: 0; text-shadow: 0 0 50px currentColor; transition: 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            white-space: pre-line; line-height: 1.2;
+        }
+        .phase-alert-show { opacity: 1 !important; transform: translate(-50%, -50%) scale(1) !important; }
+
+        /* ================= 底部大尺寸动作与 HP 提示面板 ================= */
+        #player-status-board {
+            position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%);
+            background: rgba(10, 10, 20, 0.95); border: 2px solid var(--neon-blue);
+            padding: 20px 40px; border-radius: 25px; z-index: 150;
+            box-shadow: 0 0 40px rgba(0, 255, 255, 0.15);
+            display: none; flex-direction: column; align-items: center; gap: 10px;
+            min-width: 600px;
+        }
+        .status-header { display: flex; justify-content: space-between; width: 100%; align-items: center; padding-bottom: 10px; border-bottom: 1px solid rgba(255,255,255,0.1);}
+        #ui-role-name { font-size: 28px; font-weight: bold; }
+        #ui-hp { font-size: 36px; font-weight: 900; color: var(--neon-blue); text-shadow: 0 0 20px currentColor;}
+        #ui-task { font-size: 42px; font-weight: 900; margin-top: 10px; text-shadow: 0 0 20px currentColor; text-align: center;}
+
+        /* 提示词 */
+        #board-hint {
+            position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%); font-size: 24px; font-weight: bold;
+            background: rgba(0,0,0,0.8); padding: 15px 40px; border-radius: 40px; border: 2px solid var(--neon-yellow); color: var(--neon-yellow); display: none; z-index: 150; box-shadow: 0 0 30px var(--neon-yellow);
+        }
+
+        /* ================= UI 弹窗 ================= */
+        .overlay {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.85); backdrop-filter: blur(10px);
+            display: flex; justify-content: center; align-items: center; z-index: 200; flex-direction: column;
+        }
+        .modal { background: var(--panel-bg); border: 1px solid var(--neon-blue); padding: 30px; border-radius: 15px; width: 800px; max-width: 95vw; max-height: 90vh; overflow-y: auto; box-shadow: 0 0 50px rgba(0,255,255,0.1); }
+        .modal h2 { color: var(--neon-blue); margin-bottom: 20px; text-align: center; font-size: 28px; text-shadow: 0 0 10px var(--neon-blue);}
+        
+        .role-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-top: 10px;}
+        .role-btn { background: rgba(0,0,0,0.6); border: 1px solid #444; color: white; padding: 15px; border-radius: 10px; cursor: pointer; text-align: left; display: flex; flex-direction: column; gap: 5px; transition: 0.2s; position: relative; overflow: hidden; }
+        .role-btn:hover { transform: translateY(-3px); border-color: currentColor; box-shadow: 0 5px 20px rgba(0,0,0,0.5), inset 0 0 20px currentColor; }
+        .role-title { font-size: 20px; font-weight: bold; }
+        .role-tag { position: absolute; top: 10px; right: 10px; font-size: 10px; background: rgba(255,255,255,0.2); padding: 2px 6px; border-radius: 5px; }
+
+        #end-overlay { display: none; }
+        #end-msg { font-size: 70px; font-weight: 900; text-shadow: 0 0 40px currentColor; margin-bottom: 40px; text-align: center; line-height: 1.2;}
+    </style>
+</head>
+<body>
+
+    <!-- 阶段切换巨型横幅 -->
+    <div id="phase-alert"></div>
+
+    <header id="hud">
+        <div class="hud-group">
+            <div class="hud-item" id="hud-time-box"><span class="hud-label">全场倒计时</span><span class="hud-value text-blue" id="ui-time">10:00</span></div>
+            <div class="hud-item"><span class="hud-label">场上存活</span><span class="hud-value text-yellow" id="ui-alive">- / 8</span></div>
+        </div>
+        <div id="rhythm-indicator">
+            <span id="rhythm-text" class="text-green">阶段：备战部署</span>
+            <div class="rhythm-bar"><div id="rhythm-progress"></div></div>
+        </div>
+        <div class="hud-group">
+            <div style="display: flex; gap: 15px;">
+                <button class="btn" id="btn-switch" onclick="toggleView()" style="display:none; padding: 10px 20px; font-size: 16px;">👁️ 切换动作捕捉</button>
+                <button class="btn btn-relocate" id="btn-relocate" onclick="enableRelocation()" style="padding: 10px 20px; font-size: 16px;">🔄 重新换位种下</button>
+            </div>
+        </div>
+    </header>
+
+    <!-- 底部超大面板 (HP 和 任务) -->
+    <div id="player-status-board">
+        <div class="status-header">
+            <span id="ui-role-name">未选择角色</span>
+            <span id="ui-hp">HP: -</span>
+        </div>
+        <div id="ui-task">等待部署...</div>
+    </div>
+
+    <!-- 部署时的提示词 -->
+    <div id="board-hint">请在发光区域点击部署</div>
+
+    <main id="view-container">
+        <!-- 2D 策略沙盘 -->
+        <section id="view-2d" class="view active">
+            <div id="board-scale-wrapper">
+                <div id="battle-board">
+                    <div class="divider-line"></div>
+                    <div id="grid-layout"></div>
+                    <canvas id="fx-canvas" width="1200" height="500"></canvas>
+                </div>
+            </div>
+        </section>
+
+        <!-- 3D 动作捕捉 -->
+        <section id="view-3d" class="view">
+            <h2 style="color: var(--neon-blue); margin-bottom: 15px; text-shadow: 0 0 10px var(--neon-blue); font-size: 28px;">智能动作识别校验引擎</h2>
+            <div class="camera-feed" id="cam-feed-wrapper">
+                <video id="video-element" autoplay playsinline></video>
+                <!-- 骨骼渲染Canvas -->
+                <canvas id="pose-canvas" width="800" height="450"></canvas>
+                <div id="action-feedback">GREAT! +1</div>
+            </div>
+        </section>
+    </main>
+
+    <!-- UI 选角流程 -->
+    <div class="overlay" id="setup-overlay">
+        <div class="modal" id="modal-step1">
+            <h2>选择阵营 (镜像模式)</h2>
+            <p style="text-align: center; color: #aaa; margin-bottom: 20px;">僵尸从最右侧进攻，植物在左侧四列布防。僵尸突破最左侧即获胜。</p>
+            <div class="role-grid">
+                <button class="role-btn" onclick="selectFaction('plant')" style="align-items: center; padding: 30px; color: var(--neon-green);">
+                    <span style="font-size: 50px; margin-bottom: 10px;">🛡️</span><span style="font-size: 24px; font-weight:bold;">植物防守方</span>
+                    <span style="font-size: 12px; color: #ccc; margin-top: 10px;">可随时换位，防守大闸</span>
+                </button>
+                <button class="role-btn" onclick="selectFaction('zombie')" style="align-items: center; padding: 30px; color: var(--neon-purple);">
+                    <span style="font-size: 50px; margin-bottom: 10px;">🧟</span><span style="font-size: 24px; font-weight:bold;">僵尸进攻方</span>
+                    <span style="font-size: 12px; color: #ccc; margin-top: 10px;">勇往直前，撕裂防线</span>
+                </button>
+            </div>
+            <p id="loading-ai" style="text-align: center; margin-top: 20px; color: var(--neon-yellow);">⏳ 正在初始化视觉大模型并请求摄像头权限...</p>
+        </div>
+
+        <div class="modal" id="modal-step2" style="display: none;">
+            <h2>选择运动角色</h2>
+            <div class="role-grid" id="role-list"></div>
+        </div>
+    </div>
+
+    <!-- 结算屏 -->
+    <div class="overlay" id="end-overlay">
+        <div id="end-msg">游戏结束</div>
+        <button class="btn" onclick="location.reload()" style="font-size: 24px; padding: 15px 50px; border-color: white; color: white;">重新演练</button>
+    </div>
+
+<script>
+/**
+ * ==========================================
+ * 自适应视口缩放引擎
+ * ==========================================
+ */
+function adjustScale() {
+    const container = document.getElementById('view-container');
+    const boardWrapper = document.getElementById('board-scale-wrapper');
+    const camFeed = document.getElementById('cam-feed-wrapper');
+    
+    // 留出底部区域给巨大的 HUD
+    let availableW = container.clientWidth - 40; 
+    let availableH = container.clientHeight - 180;
+    
+    let scaleX = availableW / 1200; let scaleY = availableH / 500;
+    let finalScale = Math.min(1, scaleX, scaleY);
+    boardWrapper.style.transform = `scale(${finalScale})`;
+
+    let camScale = Math.min(1, availableW / 800, availableH / 450);
+    camFeed.style.transform = `scale(${camScale})`;
+}
+window.addEventListener('resize', adjustScale);
+window.addEventListener('DOMContentLoaded', adjustScale);
+
+/**
+ * ==========================================
+ * 核心数据与 9 大角色机制
+ * ==========================================
+ */
+const CONFIG = {
+    rows: 4, cols: 8, cellW: 1200/8, cellH: 500/4,
+    totalTime: 600, hiitActive: 10, hiitRest: 5
+};
+
+const ROLES = {
+    // 【修改点】：月季种下任务改为 6，攻击任务改为 3
+    rose:    { faction: 'plant', name: '红月季', icon: '🌹', hp: 1, action: '扩胸运动', actionCode: 'expand', plantReq: 6, atkReq: 3, type: 'shoot', range: 5, dmg: 1, color: '#39ff14', tag: '主力射手' },
+    willow:  { faction: 'plant', name: '杨絮团', icon: '☁️', hp: 2, action: '左右侧拉伸', actionCode: 'stretch', plantReq: 10, atkReq: 4, type: 'shoot', range: 4, dmg: 0, color: '#ffffff', effect: 'blind', tag: '迷眼干扰' },
+    haitang: { faction: 'plant', name: '春睡海小棠', icon: '🌸', hp: 1, action: '单腿硬拉', actionCode: 'deadlift', plantReq: 8, atkReq: 4, type: 'shoot', range: 3, dmg: 1, color: '#ff66b2', effect: 'sleep', tag: '强行催眠' },
+    mahua:   { faction: 'plant', name: '嘎嘣脆麻花', icon: '🧱', hp: 4, action: '高抬腿踏步', actionCode: 'highknee', plantReq: 20, atkReq: 999, type: 'defend', dmg: 1, tag: '极致防御反伤' },
+    radish:  { faction: 'plant', name: '沙窝萝卜雷', icon: '💣', hp: 1, action: '深蹲', actionCode: 'squat', plantReq: 8, atkReq: 999, type: 'trap', dmg: 4, tag: '地雷秒杀' },
+    
+    z_shield:{ faction: 'zombie', name: '煎饼僵尸', icon: '🛡️', hp: 4, action: '吸腿跳', actionCode: 'jump', respawnReq: 10, moveReq: 3, hasShield: true, tag: '前排护盾' },
+    z_diver: { faction: 'zombie', name: '跳水大爷', icon: '🤿', hp: 4, action: '开合跳', actionCode: 'jump', respawnReq: 10, moveReq: 3, canJump: true, tag: '刺客跃过' },
+    z_combo: { faction: 'zombie', name: '嘛没学僵尸', icon: '🕺', hp: 4, action: '侧滑步', actionCode: 'sidestep', respawnReq: 10, moveReq: 3, isCombo: true, tag: '连招爆发' },
+    z_tank:  { faction: 'zombie', name: '盘头大妈', icon: '👵', hp: 6, action: '弓步蹲', actionCode: 'lunge', respawnReq: 10, moveReq: 3, tag: '重装坦克' }
+};
+
+let game = {
+    state: 'setup', faction: null, roleKey: null, userPos: null,
+    timeLeft: CONFIG.totalTime, hiitTimer: 0, isActive: true,
+    grid: Array(CONFIG.rows).fill(null).map(() => Array(CONFIG.cols).fill(null))
+};
+
+/**
+ * ==========================================
+ * 震动与阶段切换反馈 (仅在错误动作时震动)
+ * ==========================================
+ */
+function triggerScreenShake() {
+    document.body.classList.remove('screen-shake');
+    void document.body.offsetWidth; // 触发重绘
+    document.body.classList.add('screen-shake');
+}
+
+function triggerPhaseAlert(text, color) {
+    const alertEl = document.getElementById('phase-alert');
+    alertEl.innerText = text; alertEl.style.color = color;
+    alertEl.classList.add('phase-alert-show');
+    // 取消阶段切换时的震动
+    setTimeout(() => { alertEl.classList.remove('phase-alert-show'); }, 1500);
+}
+
+/**
+ * ==========================================
+ * UI 流程控制
+ * ==========================================
+ */
+function selectFaction(f) {
+    game.faction = f;
+    const list = document.getElementById('role-list'); list.innerHTML = '';
+    for (const [key, data] of Object.entries(ROLES)) {
+        if (data.faction === f) {
+            let col = f === 'plant' ? 'var(--neon-green)' : 'var(--neon-purple)';
+            let taskStr = f === 'plant' ? `种下:${data.plantReq}次 | 攻击:${data.atkReq<99?data.atkReq+'次':'无'}` : `复活:${data.respawnReq}次 | 前进:${data.moveReq}次`;
+            list.innerHTML += `
+                <button class="role-btn" style="color: ${col};" onclick="selectRole('${key}')">
+                    <div class="role-tag">${data.tag}</div>
+                    <div class="role-title">${data.icon} ${data.name}</div>
+                    <div style="font-size: 13px; color: #fff; margin-top:5px;">动作：${data.action}</div>
+                    <div style="font-size: 12px; color: #aaa; margin-top:2px;">${taskStr} | 血量: ${data.hp}HP</div>
+                </button>`;
+        }
+    }
+    document.getElementById('modal-step1').style.display = 'none';
+    document.getElementById('modal-step2').style.display = 'block';
+}
+
+function selectRole(key) {
+    game.roleKey = key;
+    document.getElementById('setup-overlay').style.display = 'none';
+    
+    const gridLayout = document.getElementById('grid-layout'); gridLayout.innerHTML = '';
+    for (let r = 0; r < CONFIG.rows; r++) {
+        for (let c = 0; c < CONFIG.cols; c++) {
+            let cell = document.createElement('div');
+            if (c < 4) cell.className = 'cell plant-zone';      
+            else if (c === 7) cell.className = 'cell zombie-zone'; 
+            else cell.className = 'cell';
+            
+            cell.id = `cell-${r}-${c}`;
+            cell.onclick = () => handleCellClick(r, c);
+            gridLayout.appendChild(cell);
+        }
+    }
+    
+    game.state = 'positioning';
+    document.body.className = `deploy-${game.faction}`;
+    const hint = document.getElementById('board-hint');
+    hint.innerText = game.faction === 'plant' ? "📍 请在左侧 4 列中选择阵地进行【种下】部署" : "📍 请在最右侧选择您的【出发点】";
+    hint.style.display = 'block';
+    
+    setTimeout(adjustScale, 100);
+}
+
+function handleCellClick(r, c) {
+    if (game.state === 'positioning') {
+        if (game.faction === 'plant' && c > 3) { alert("植物只能部署在左半场！"); return; }
+        if (game.faction === 'zombie' && c !== 7) { alert("僵尸必须从最右侧边缘出发！"); return; }
+        
+        document.body.className = ''; 
+        document.getElementById('board-hint').style.display = 'none';
+        document.getElementById('player-status-board').style.display = 'flex'; // 显示底部面板
+        document.getElementById('btn-switch').style.display = 'flex';
+        if (game.faction === 'plant') document.getElementById('btn-relocate').style.display = 'flex';
+        
+        startGame(r, c);
+    } 
+    else if (game.state === 'playing' && document.body.classList.contains('deploy-plant')) {
+        if (c > 3) { alert("只能换位到左侧四列！"); return; }
+        if (game.grid[r][c] && !game.grid[r][c].isUser) { alert("该位置已有其他单位！"); return; }
+        
+        if(game.userPos && game.grid[game.userPos.r][game.userPos.c]) { game.grid[game.userPos.r][game.userPos.c] = null; }
+        
+        spawnEntity(r, c, game.roleKey, true); // 重新生成为 planting
+        game.userPos = { r, c };
+        
+        document.body.classList.remove('deploy-plant');
+        document.getElementById('board-hint').style.display = 'none';
+        document.getElementById('player-status-board').style.display = 'flex';
+        renderGrid(); updateHUD();
+    }
+}
+
+function enableRelocation() {
+    if (game.faction !== 'plant') return;
+    document.body.classList.add('deploy-plant');
+    document.getElementById('player-status-board').style.display = 'none';
+    const hint = document.getElementById('board-hint');
+    hint.innerText = "🔄 换位模式：请点击左侧空地重新部署 (需重新完成种下任务)";
+    hint.style.display = 'block';
+}
+
+/**
+ * ==========================================
+ * 游戏主循环与 AI 布局
+ * ==========================================
+ */
+let gameInterval, simInterval;
+
+function startGame(uR, uC) {
+    game.state = 'playing'; game.userPos = { r: uR, c: uC };
+    spawnEntity(uR, uC, game.roleKey, true);
+    
+    let pCount = game.faction === 'plant' ? 1 : 0; let zCount = game.faction === 'zombie' ? 1 : 0;
+    autoSpawnZombies(4 - zCount);
+    autoSpawnPlants(4 - pCount);
+
+    renderGrid(); updateHUD();
+    triggerPhaseAlert("🔥 战斗开始\n(请做动作)", "var(--neon-red)");
+    
+    gameInterval = setInterval(gameTick, 1000);
+    simInterval = setInterval(simulateAIActions, 1000);
+    requestAnimationFrame(renderCanvas);
+}
+
+function spawnEntity(r, c, key, isUser) {
+    let d = ROLES[key];
+    game.grid[r][c] = { 
+        isUser: isUser, key: key, data: d, hp: d.hp, progress: 0, 
+        state: d.faction === 'plant' ? 'planting' : 'active', 
+        hitTimer: 0, attackedThisRound: false, 
+        shield: d.hasShield ? 1 : 0, hasJumped: false, combo: 0,
+        debuffSleep: 0, debuffBlind: 0
+    };
+}
+
+function autoSpawnZombies(count) {
+    let keys = Object.keys(ROLES).filter(k => ROLES[k].faction === 'zombie'); let spawned = 0;
+    while (spawned < count) {
+        let r = Math.floor(Math.random() * CONFIG.rows);
+        if (!game.grid[r][7]) { spawnEntity(r, 7, keys[Math.floor(Math.random() * keys.length)], false); spawned++; }
+    }
+}
+
+function autoSpawnPlants(count) {
+    let keys = Object.keys(ROLES).filter(k => ROLES[k].faction === 'plant'); let spawned = 0;
+    while (spawned < count) {
+        let r = Math.floor(Math.random() * CONFIG.rows);
+        let key = keys[Math.floor(Math.random() * keys.length)];
+        let c = (key === 'mahua' || key === 'radish') ? (Math.random()>0.5?3:2) : Math.floor(Math.random()*2);
+        if (!game.grid[r][c]) { spawnEntity(r, c, key, false); spawned++; }
+    }
+}
+
+function renderGrid() {
+    let aliveCount = 0;
+    for (let r = 0; r < CONFIG.rows; r++) {
+        for (let c = 0; c < CONFIG.cols; c++) {
+            let cell = document.getElementById(`cell-${r}-${c}`); cell.innerHTML = '';
+            let ent = game.grid[r][c];
+            if (ent) {
+                if (ent.hp > 0) aliveCount++;
+                let div = document.createElement('div');
+                div.className = `entity`;
+                div.style.color = ent.data.faction === 'plant' ? 'var(--neon-green)' : 'var(--neon-purple)';
+                
+                if (ent.hp <= 0) {
+                    div.classList.add(ent.data.faction === 'zombie' ? 'respawning' : 'dead');
+                } else if (ent.state === 'planting') {
+                    div.classList.add('planting');
+                } else if (ent.attackedThisRound) {
+                    div.classList.add('atk-done');
+                }
+                
+                if (ent.hitTimer > 0) div.classList.add('hit-anim');
+                if (ent.isUser) { let tag = document.createElement('div'); tag.className = 'user-tag'; tag.innerText = 'YOU'; div.appendChild(tag); }
+                
+                if (ent.shield > 0 && ent.hp > 0) { let s = document.createElement('div'); s.className = 'shield-ring'; div.appendChild(s); }
+                let dStr = ''; if (ent.debuffSleep > 0) dStr = '💤'; else if (ent.debuffBlind > 0) dStr = '🌫️';
+                if (dStr && ent.hp > 0) { let tag = document.createElement('div'); tag.className = 'debuff-tag'; tag.innerText = dStr; div.appendChild(tag); }
+
+                let req = (ent.state === 'planting' || ent.data.faction === 'zombie') ? (ent.data.plantReq || ent.data.respawnReq || ent.data.moveReq) : ent.data.atkReq;
+                if (ent.data.faction === 'zombie' && ent.debuffBlind > 0) req *= 2; 
+
+                let stateColor = (ent.state === 'planting' || ent.hp <= 0) ? 'var(--neon-yellow)' : (ent.hp>0?'#fff':'#444');
+                let taskText = ent.hp <= 0 ? (ent.data.faction === 'zombie' ? '复活' : '阵亡') : (ent.state === 'planting' ? '种下' : (ent.attackedThisRound ? '等待' : (ent.data.faction==='plant'?'攻击':'前进')));
+                
+                div.innerHTML += `<div class="icon">${ent.data.icon}</div><div class="stats">HP: ${Math.max(0, ent.hp)}</div>`;
+                if((ent.hp > 0 || ent.data.faction === 'zombie') && req < 99) {
+                    div.innerHTML += `<div class="task" style="color:${stateColor}">${taskText} ${Math.floor(ent.progress)}/${req}</div>`;
+                }
+                cell.appendChild(div);
+            }
+        }
+    }
+    document.getElementById('ui-alive').innerText = `${aliveCount} / 8`;
+}
+
+function gameTick() {
+    if (game.state !== 'playing') return;
+    game.timeLeft--; game.hiitTimer++;
+
+    if (game.isActive && game.hiitTimer >= CONFIG.hiitActive) {
+        game.isActive = false; game.hiitTimer = 0;
+        triggerPhaseAlert("⏸ 间隔休息\n(仅允许种下/复活)", "var(--neon-yellow)");
+        document.body.classList.add('rest-phase');
+    } 
+    else if (!game.isActive && game.hiitTimer >= CONFIG.hiitRest) { 
+        game.isActive = true; game.hiitTimer = 0;
+        triggerPhaseAlert("🔥 战斗继续\n(全动作解锁)", "var(--neon-red)");
+        document.body.classList.remove('rest-phase');
+        
+        for(let r=0; r<CONFIG.rows; r++) for(let c=0; c<CONFIG.cols; c++) {
+            let ent = game.grid[r][c];
+            if(ent) {
+                ent.attackedThisRound = false;
+                if(ent.debuffSleep > 0) ent.debuffSleep--;
+                if(ent.debuffBlind > 0) ent.debuffBlind--;
+            }
+        }
+    }
+
+    for(let r=0; r<CONFIG.rows; r++) for(let c=0; c<CONFIG.cols; c++) {
+        if(game.grid[r][c] && game.grid[r][c].hitTimer > 0) game.grid[r][c].hitTimer--;
+    }
+
+    updateHUD(); renderGrid();
+    if (game.timeLeft <= 0) { game.state = 'end'; showEnd("防守成功！时间耗尽", "var(--neon-blue)"); }
+}
+
+function updateHUD() {
+    let m = Math.floor(game.timeLeft / 60).toString().padStart(2, '0'); let s = (game.timeLeft % 60).toString().padStart(2, '0');
+    document.getElementById('ui-time').innerText = `${m}:${s}`;
+
+    const rText = document.getElementById('rhythm-text'); const rProg = document.getElementById('rhythm-progress');
+    if (game.isActive) {
+        rText.innerText = "🔥 运动执行阶段"; rText.className = "text-green"; rProg.style.background = "var(--neon-green)";
+        rProg.style.width = `${((CONFIG.hiitActive - game.hiitTimer) / CONFIG.hiitActive) * 100}%`;
+    } else {
+        rText.innerText = "⏸ 休息间隔阶段"; rText.className = "text-yellow"; rProg.style.background = "var(--neon-yellow)";
+        rProg.style.width = `${((CONFIG.hiitRest - game.hiitTimer) / CONFIG.hiitRest) * 100}%`;
+    }
+
+    if (game.userPos) {
+        let uEnt = game.grid[game.userPos.r][game.userPos.c];
+        const uiRole = document.getElementById('ui-role-name'); 
+        const uiHp = document.getElementById('ui-hp'); 
+        const uiTask = document.getElementById('ui-task');
+        
+        if (uEnt) {
+            uiRole.innerText = `${uEnt.data.icon} ${uEnt.data.name}`;
+            uiRole.style.color = uEnt.data.faction === 'plant' ? 'var(--neon-green)' : 'var(--neon-purple)';
+            uiHp.innerText = `HP: ${Math.max(0, uEnt.hp)}`; 
+            uiHp.style.color = uEnt.hp > 2 ? 'var(--neon-blue)' : 'var(--neon-red)';
+            
+            let isPlantingOrRespawning = (uEnt.state === 'planting' || uEnt.hp <= 0);
+            let req = isPlantingOrRespawning ? (uEnt.data.plantReq || uEnt.data.respawnReq) : (uEnt.data.faction === 'zombie' ? uEnt.data.moveReq : uEnt.data.atkReq);
+            
+            if (isPlantingOrRespawning) {
+                uiTask.innerText = `[${uEnt.hp <= 0 ? '复活' : '部署'}] ${uEnt.data.action} (${Math.floor(uEnt.progress)}/${req})`; 
+                uiTask.style.color = "var(--neon-yellow)";
+            } else if (!game.isActive) {
+                uiTask.innerText = "⚠️ 休息期无法攻击/前进，请原地调整"; 
+                uiTask.style.color = "gray";
+            } else if (uEnt.attackedThisRound) {
+                uiTask.innerText = "✔️ 本轮已攻击，等待下回合"; 
+                uiTask.style.color = "gray";
+            } else {
+                uiTask.innerText = `[执行] ${uEnt.data.action} (${Math.floor(uEnt.progress)}/${req})`; 
+                uiTask.style.color = "var(--neon-green)";
+            }
+        }
+    }
+}
+
+/**
+ * ==========================================
+ * 沙盘逻辑
+ * ==========================================
+ */
+function simulateAIActions() {
+    if (game.state !== 'playing') return;
+    let newGrid = Array(CONFIG.rows).fill(null).map(() => Array(CONFIG.cols).fill(null));
+
+    // 1. 植物处理
+    for (let r = 0; r < CONFIG.rows; r++) {
+        for (let c = 0; c < 4; c++) {
+            let ent = game.grid[r][c];
+            if (ent && ent.data.faction === 'plant') {
+                if (ent.hp <= 0) { newGrid[r][c] = ent; continue; }
+
+                if (ent.state === 'planting') {
+                    if(!ent.isUser) ent.progress += 1.5;
+                    if (ent.progress >= ent.data.plantReq) { ent.state = 'active'; ent.progress = 0; }
+                } 
+                else if (game.isActive && ent.state === 'active' && ent.data.type === 'shoot' && !ent.attackedThisRound) {
+                    if(!ent.isUser) ent.progress += 1.5; 
+                    let hasTarget = false;
+                    for(let zc = c+1; zc <= Math.min(CONFIG.cols-1, c+ent.data.range); zc++) { 
+                        if(game.grid[r][zc] && game.grid[r][zc].data.faction === 'zombie' && game.grid[r][zc].hp > 0) hasTarget = true; 
+                    }
+                    if (hasTarget && ent.progress >= ent.data.atkReq) {
+                        ent.progress = 0; ent.attackedThisRound = true; 
+                        fireProjectile(r, c, ent.data);
+                        for(let zc = c+1; zc < CONFIG.cols; zc++) {
+                            let target = game.grid[r][zc];
+                            if(target && target.data.faction === 'zombie' && target.hp > 0) {
+                                applyDamage(target, ent.data.dmg, ent.data.effect);
+                                target.hitTimer = 2; createParticles(r, zc, ent.data.color);
+                                // 移除震动
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. 僵尸处理
+    for (let r = 0; r < CONFIG.rows; r++) {
+        for (let c = 0; c < CONFIG.cols; c++) {
+            let ent = game.grid[r][c];
+            if (ent && ent.data.faction === 'zombie') {
+                
+                if (ent.hp <= 0) {
+                    if(!ent.isUser) ent.progress += 1.5;
+                    if(ent.progress >= ent.data.respawnReq) {
+                        ent.hp = ent.data.hp; ent.progress = 0; ent.state = 'active';
+                        createParticles(r, c, '#b026ff', 30);
+                    }
+                    newGrid[r][c] = ent; 
+                    continue;
+                }
+
+                if (!game.isActive) { newGrid[r][c] = ent; continue; }
+                if (ent.debuffSleep > 0) { newGrid[r][c] = ent; continue; }
+
+                if (!ent.isUser) ent.progress += 1.2;
+                let req = ent.data.moveReq;
+                if (ent.debuffBlind > 0) req *= 2; 
+                
+                if (ent.progress >= req) {
+                    ent.progress = 0;
+                    
+                    let steps = 1; let dmg = 1;
+                    if (ent.data.isCombo) {
+                        ent.combo++;
+                        if (ent.combo >= 3) { steps = 2; dmg = 2; ent.combo = 0; createParticles(r, c, '#ffea00'); }
+                    }
+
+                    let targetC = c;
+                    for(let s=0; s<steps; s++) {
+                        if (targetC > 0) {
+                            let nextEnt = game.grid[r][targetC-1];
+                            if (!nextEnt || (nextEnt.data.faction === 'plant' && nextEnt.hp <= 0)) { 
+                                targetC--; 
+                            } else if (nextEnt.data.faction === 'plant') {
+                                if (ent.data.canJump && !ent.hasJumped && targetC >= 2 && (!game.grid[r][targetC-2] || (game.grid[r][targetC-2].data.faction==='plant'&&game.grid[r][targetC-2].hp<=0))) {
+                                    targetC -= 2; ent.hasJumped = true; createParticles(r, targetC+2, '#00ffff');
+                                } else {
+                                    if(nextEnt.data.type === 'trap') {
+                                        createParticles(r, targetC-1, '#39ff14', 50); 
+                                        ent.hp = 0; nextEnt.hp = 0;
+                                    } else {
+                                        nextEnt.hp -= dmg; nextEnt.hitTimer = 2; createParticles(r, targetC-1, '#ff003c');
+                                        if (nextEnt.hp <= 0 && nextEnt.data.name === '嘎嘣脆麻花') { 
+                                            applyDamage(ent, 1); createParticles(r, targetC, '#fff'); 
+                                        }
+                                    }
+                                    break; 
+                                }
+                            } else { break; }
+                        } else {
+                            game.state = 'end'; showEnd("防线被撕裂，僵尸胜利！", "var(--neon-purple)"); return;
+                        }
+                    }
+                    newGrid[r][targetC] = ent;
+                } else { newGrid[r][c] = ent; }
+            } else if (ent && !newGrid[r][c]) {
+                newGrid[r][c] = ent; 
+            }
+        }
+    }
+
+    game.grid = newGrid;
+    
+    if(game.userPos) {
+        let u = game.grid[game.userPos.r][game.userPos.c];
+        if(!u) game.grid[game.userPos.r][game.userPos.c] = { isUser: true, data: ROLES[game.roleKey], hp: 0, state: 'dead', progress:0 }; 
+    }
+    renderGrid(); updateHUD();
+}
+
+function applyDamage(target, dmg, effect) {
+    if (dmg > 0) { if (target.shield > 0) { target.shield--; dmg = 0; } target.hp -= dmg; }
+    if (target.hp > 0 && effect) {
+        if (effect === 'sleep') target.debuffSleep = 1;
+        if (effect === 'blind') target.debuffBlind = 1;
+    }
+}
+
+function showEnd(msg, color) {
+    document.getElementById('end-overlay').style.display = 'flex';
+    document.getElementById('end-msg').innerText = msg;
+    document.getElementById('end-msg').style.color = color;
+}
+
+/**
+ * ==========================================
+ * MediaPipe 骨骼识别
+ * ==========================================
+ */
+const videoElement = document.getElementById('video-element');
+const canvasElement = document.getElementById('pose-canvas');
+const canvasCtx = canvasElement.getContext('2d');
+let poseModel = null, camera = null;
+let poseState = { expand:false, squat:false, jump:false, stretch:false, highknee:false, deadlift:false, lunge:false, sidestep:false };
+let lastTorsoX = 0;
+
+async function initMediaPipe() {
+    poseModel = new Pose({locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${f}`});
+    poseModel.setOptions({ modelComplexity: 1, smoothLandmarks: true, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+    poseModel.onResults(onPoseResults);
+    camera = new Camera(videoElement, { onFrame: async () => { await poseModel.send({image: videoElement}); }, width: 800, height: 450 });
+    await camera.start();
+    document.getElementById('loading-ai').style.display = 'none';
+}
+initMediaPipe().catch(e => { document.getElementById('loading-ai').innerText = "⚠️ 摄像头调用失败，请检查浏览器权限。"; });
+
+function onPoseResults(results) {
+    canvasCtx.save();
+    canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+    
+    canvasCtx.globalCompositeOperation = 'source-over';
+    canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+    
+    if (results.poseLandmarks) {
+        canvasCtx.globalCompositeOperation = 'lighter';
+        
+        canvasCtx.shadowColor = '#00ffff'; canvasCtx.shadowBlur = 20;
+        drawConnectors(canvasCtx, results.poseLandmarks, POSE_CONNECTIONS, {color: '#00ffff', lineWidth: 6});
+        
+        canvasCtx.shadowColor = '#39ff14'; canvasCtx.shadowBlur = 15;
+        drawLandmarks(canvasCtx, results.poseLandmarks, {color: '#39ff14', lineWidth: 3, radius: 6});
+        
+        canvasCtx.globalCompositeOperation = 'source-over';
+        
+        if (game.state === 'playing' && game.userPos) {
+            let uEnt = game.grid[game.userPos.r][game.userPos.c];
+            if (uEnt) {
+                let canAct = false;
+                if (uEnt.state === 'planting' || uEnt.hp <= 0) canAct = true;
+                else if (game.isActive && !uEnt.attackedThisRound) canAct = true;
+
+                detectSpecificAction(results.poseLandmarks, uEnt.data.actionCode, uEnt, canAct);
+            }
+        }
+    }
+    canvasCtx.restore();
+}
+
+function detectSpecificAction(lm, code, ent, canAct) {
+    const lSh=lm[11], rSh=lm[12], lWr=lm[15], rWr=lm[16], lHip=lm[23], rHip=lm[24], lKn=lm[25], rKn=lm[26], lAnk=lm[27], rAnk=lm[28];
+    let triggered = false;
+
+    if (code === 'expand') { 
+        let dist = Math.abs(lWr.x - rWr.x);
+        if (dist > 0.6) poseState.expand = true; else if (dist < 0.3 && poseState.expand) { poseState.expand = false; triggered = true; }
+    } else if (code === 'squat') { 
+        if (lHip.y > lKn.y - 0.1) poseState.squat = true; else if (lHip.y < lKn.y - 0.3 && poseState.squat) { poseState.squat = false; triggered = true; }
+    } else if (code === 'stretch') { 
+        let isS = (lWr.x < lSh.x - 0.2) || (rWr.x > rSh.x + 0.2);
+        if (isS) poseState.stretch = true; else if (!isS && poseState.stretch) { poseState.stretch = false; triggered = true; }
+    } else if (code === 'jump') { 
+        let up = lWr.y < lSh.y; let wide = Math.abs(lAnk.x - rAnk.x) > 0.3;
+        if (up || wide) poseState.jump = true; else if (!up && !wide && poseState.jump) { poseState.jump = false; triggered = true; }
+    } else if (code === 'highknee') { 
+        let up = (lKn.y < lHip.y + 0.1) || (rKn.y < rHip.y + 0.1);
+        if (up) poseState.highknee = true; else if (!up && poseState.highknee) { poseState.highknee = false; triggered = true; }
+    } else if (code === 'deadlift') { 
+        let down = lSh.y > lHip.y - 0.1;
+        if (down) poseState.deadlift = true; else if (!down && poseState.deadlift) { poseState.deadlift = false; triggered = true; }
+    } else if (code === 'lunge') { 
+        let isL = Math.abs(lAnk.x - rAnk.x) > 0.3 && (lKn.y > lAnk.y - 0.1 || rKn.y > rAnk.y - 0.1);
+        if (isL) poseState.lunge = true; else if (!isL && poseState.lunge) { poseState.lunge = false; triggered = true; }
+    } else if (code === 'sidestep') { 
+        let cx = (lSh.x + rSh.x) / 2;
+        if (Math.abs(cx - lastTorsoX) > 0.15) { triggered = true; lastTorsoX = cx; }
+    }
+
+    if (triggered) {
+        const fb = document.getElementById('action-feedback');
+        if (canAct) {
+            fb.innerText = "GREAT! +1"; fb.style.color = "var(--neon-green)";
+            ent.progress += 1; updateHUD(); renderGrid();
+        } else {
+            fb.innerText = "❌ 动作无效 (休息中/已上限)"; fb.style.color = "var(--neon-red)";
+            // 【核心修改】只有在失败(动作无效)时才触发屏幕震动
+            triggerScreenShake(); 
+        }
+        fb.style.opacity = '1'; fb.style.transform = 'translate(-50%, -60%) scale(1.2)';
+        setTimeout(() => { fb.style.opacity = '0'; fb.style.transform = 'translate(-50%, -50%) scale(1)'; }, 500);
+    }
+}
+
+/**
+ * ==========================================
+ * Canvas 粒子与发光弹道
+ * ==========================================
+ */
+const canvas = document.getElementById('fx-canvas'); const ctx = canvas.getContext('2d');
+let projectiles = [], particles = [];
+function getCoord(r, c) { return { x: c * CONFIG.cellW + CONFIG.cellW/2, y: r * CONFIG.cellH + CONFIG.cellH/2 }; }
+
+class Projectile {
+    constructor(r, c, data) { let p = getCoord(r, c); this.x=p.x+30; this.y=p.y; this.v=15; this.col=data.color; this.type=data.effect; this.time=0; }
+    update() { this.x += this.v; this.time += 0.2; }
+    draw(ctx) {
+        ctx.beginPath();
+        if(this.type === 'sleep') { ctx.arc(this.x, this.y, 14, 0, Math.PI*2); ctx.strokeStyle=this.col; ctx.lineWidth=6; ctx.stroke(); } 
+        else if(this.type === 'blind') { this.y+=Math.sin(this.time)*4; ctx.arc(this.x, this.y, 10, 0, Math.PI*2); ctx.fillStyle=this.col; ctx.fill(); } 
+        else { ctx.moveTo(this.x, this.y); ctx.lineTo(this.x-50, this.y); ctx.strokeStyle=this.col; ctx.lineWidth=6; ctx.stroke(); } 
+    }
+}
+
+class Particle {
+    constructor(x, y, color) { this.x=x+(Math.random()*40-20); this.y=y+(Math.random()*40-20); let a=Math.random()*Math.PI*2, s=Math.random()*10+2; this.vx=Math.cos(a)*s; this.vy=Math.sin(a)*s; this.life=1; this.col=color; }
+    update() { this.x+=this.vx; this.y+=this.vy; this.vy+=0.5; this.life-=0.05; }
+    draw(ctx) { ctx.globalAlpha=this.life; ctx.beginPath(); ctx.arc(this.x, this.y, 5, 0, Math.PI*2); ctx.fillStyle=this.col; ctx.fill(); ctx.globalAlpha=1; }
+}
+
+function fireProjectile(r, c, data) { projectiles.push(new Projectile(r, c, data)); }
+function createParticles(r, c, color, cnt=25) { let p = getCoord(r, c); for(let i=0; i<cnt; i++) particles.push(new Particle(p.x, p.y, color)); }
+
+function renderCanvas() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    
+    ctx.globalCompositeOperation = 'lighter'; 
+    
+    for (let i = projectiles.length - 1; i >= 0; i--) { 
+        let p=projectiles[i]; p.update(); 
+        ctx.shadowColor = p.col; ctx.shadowBlur = 15;
+        p.draw(ctx); 
+        if(p.x > canvas.width) projectiles.splice(i, 1); 
+    }
+    for (let i = particles.length - 1; i >= 0; i--) { 
+        let p=particles[i]; p.update(); 
+        ctx.shadowColor = p.col; ctx.shadowBlur = 10;
+        p.draw(ctx); 
+        if(p.life<=0) particles.splice(i, 1); 
+    }
+    
+    ctx.globalCompositeOperation = 'source-over';
+    requestAnimationFrame(renderCanvas);
+}
+
+function toggleView() {
+    const v2d = document.getElementById('view-2d'); const v3d = document.getElementById('view-3d');
+    const btn = document.getElementById('btn-switch');
+    if (v2d.classList.contains('active')) { v2d.classList.remove('active'); v3d.classList.add('active'); btn.innerText = "🌐 切回 2D 战局"; } 
+    else { v3d.classList.remove('active'); v2d.classList.add('active'); btn.innerText = "👁️ 切换动作捕捉"; }
+}
+</script>
+</body>
+</html>
